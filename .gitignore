@@ -1,0 +1,8 @@
+﻿data/
+*.csv
+*.edf
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+wandb/
+.DS_Store
