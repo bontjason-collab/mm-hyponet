@@ -8,18 +8,22 @@ per participant, reconstructs the underlying series.
 IMPORTANT: BrisT1D is NOT uniformly sampled. Some participants are recorded every
 5 minutes, others every 15 minutes. This adapter detects each participant's native
 spacing and places their readings on that participant's own grid. It does NOT
-standardize resolution across participants -- that is the job of a separate,
-dataset-agnostic resample step, so the adapter stays honest (native resolution,
-no fabricated points).
+standardize resolution across participants -- that is a later, dataset-agnostic
+resample step -- so the adapter stays honest (native resolution, no fabrication).
+
+Self-declared activity text is carried through RAW and unmodified (activity_type).
+Normalizing free-text activity/meal labels into a fixed category set is a separate,
+dataset-agnostic converter run later, so the adapter never bakes in dataset-specific
+cleaning decisions.
 
 Timestamps are rebuilt from the clock-only 'time' field (HH:MM:SS), adding a
 calendar day whenever the clock rolls past midnight. Gaps become rows with a real
-timestamp + participant_id but NaN measurements, so downstream masking/labeling
-see them as genuinely missing.
+timestamp + participant_id but NaN/empty measurements.
 
 Neutral output columns:
-  participant_id, timestamp, glucose, insulin, carbs, heart_rate, steps, calories
-Glucose is converted mmol/L -> mg/dL.
+  participant_id, timestamp, glucose, insulin, carbs,
+  heart_rate, steps, calories, activity_type
+Glucose is converted mmol/L -> mg/dL. activity_type is raw text ('' when none).
 """
 
 import pandas as pd
@@ -32,12 +36,13 @@ def brist1d_to_long(raw_csv_path: str) -> pd.DataFrame:
 
     # The "current moment" value of each signal is its '-0:00' lag column.
     now_cols = {
-        "bg-0:00":      "glucose",
-        "insulin-0:00": "insulin",
-        "carbs-0:00":   "carbs",
-        "hr-0:00":      "heart_rate",
-        "steps-0:00":   "steps",
-        "cals-0:00":    "calories",
+        "bg-0:00":       "glucose",
+        "insulin-0:00":  "insulin",
+        "carbs-0:00":    "carbs",
+        "hr-0:00":       "heart_rate",
+        "steps-0:00":    "steps",
+        "cals-0:00":     "calories",
+        "activity-0:00": "activity_type",   # raw self-declared text, preserved as-is
     }
     keep = ["p_num", "time"] + list(now_cols.keys())
     out = df[keep].copy().rename(columns=now_cols)
@@ -51,7 +56,7 @@ def brist1d_to_long(raw_csv_path: str) -> pd.DataFrame:
     result = pd.concat(pieces, ignore_index=True)
     return result[[
         "participant_id", "timestamp", "glucose",
-        "insulin", "carbs", "heart_rate", "steps", "calories",
+        "insulin", "carbs", "heart_rate", "steps", "calories", "activity_type",
     ]]
 
 
@@ -59,8 +64,7 @@ def _rebuild_one_participant(pid: str, g: pd.DataFrame) -> pd.DataFrame:
     """
     Build a monotonic datetime from clock-only 'time' (rolling to the next
     calendar day past midnight), detect this participant's native sampling
-    step from the data, then reindex onto that step so gaps are explicit
-    NaN rows.
+    step from the data, then reindex onto that step so gaps are explicit rows.
     """
     g = g.reset_index(drop=True)
     tod = pd.to_timedelta(g["time"])          # time-of-day as duration
@@ -82,7 +86,7 @@ def _rebuild_one_participant(pid: str, g: pd.DataFrame) -> pd.DataFrame:
     diffs = g["timestamp"].diff().dropna()
     step = diffs.mode().iloc[0]
 
-    # reindex onto that participant's own grid; gaps become NaN measurement rows
+    # reindex onto that participant's own grid; gaps become NaN/empty rows
     full = pd.date_range(g["timestamp"].iloc[0], g["timestamp"].iloc[-1], freq=step)
     g = g.set_index("timestamp").reindex(full)
     g["participant_id"] = pid
@@ -96,7 +100,5 @@ if __name__ == "__main__":
     print("\nrows:", len(long_df))
     print("participants:", long_df["participant_id"].nunique())
     print("gap rows (glucose NaN):", long_df["glucose"].isna().sum())
-    # show detected spacing per participant
-    for pid, g in long_df.groupby("participant_id", sort=False):
-        step = g["timestamp"].diff().dropna().mode().iloc[0]
-        print(f"  {pid}: step={step}, rows={len(g)}")
+    print("activity_type non-empty:", long_df["activity_type"].notna().sum())
+    print("distinct activities:", long_df["activity_type"].dropna().nunique())
