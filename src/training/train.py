@@ -30,7 +30,7 @@ MODEL_REGISTRY = {
 
 # ============ EXPERIMENT SETTINGS (the ablation knobs) ============
 MODEL_NAME = "tcn"
-FEATURES   = ["glucose"]          # add "insulin", "carbs", "heart_rate", ... later
+FEATURES   = ["glucose", "iob"]          # add "insulin", "carbs", "heart_rate", ... later;added iob
 TASK       = "forecast"           # "forecast" | "alert"
 LOOKBACK   = 12                   # 3 hours at 15-min
 VAL_PIDS   = ["p04", "p10"]
@@ -157,5 +157,5 @@ def run(csv_path):
 
 
 if __name__ == "__main__":
-    res = run("data/processed/brist1d/brist1d_resampled.csv")
+    res = run("data/processed/brist1d/brist1d_features.csv")
     print(res.to_string(index=False))
