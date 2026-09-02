@@ -30,7 +30,7 @@ MODEL_REGISTRY = {
 
 # ============ EXPERIMENT SETTINGS (the ablation knobs) ============
 MODEL_NAME = "tcn"
-FEATURES   = ["glucose", "iob", "cob"]          # add "insulin", "carbs", "heart_rate", ... later;added iob; added cob;
+FEATURES   = ["glucose", "iob", "cob", "activity_decay_fast", "activity_decay_medium", "activity_decay_slow"]
 TASK       = "forecast"           # "forecast" | "alert"
 LOOKBACK   = 12                   # 3 hours at 15-min
 VAL_PIDS   = ["p04", "p10"]
