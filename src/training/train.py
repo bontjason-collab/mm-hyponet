@@ -1,16 +1,19 @@
 """
 Model-agnostic training driver for MM-HypoNet.
 
-run() args: csv_path, features, task ("forecast"|"alert"), epochs, model_name, batch, lr.
+run() args: csv_path, features, task ("forecast"|"alert"), epochs, model_name,
+            batch, lr, balanced_sampler.
 
 Split selection:
-  - If the data has a 'split' column (DiaData: train/val/holdout), use it, and
-    evaluate the holdout PER COHORT (the cross-cohort robustness test).
-  - Else fall back to VAL_PIDS (BrisT1D: hold out named participants).
+  - 'split' column present (DiaData: train/val/holdout) -> use it, evaluate holdout per cohort.
+  - else fall back to VAL_PIDS (BrisT1D).
 
-Alert task: focal loss + balanced sampling; reports sensitivity/false-alarm/AUC,
-and per-epoch validation AUC. No early stopping (fixed epochs, fair across models).
-Returns (metrics_table, extras) where extras carries probabilities/labels for ROC.
+Alert imbalance handling has two independent mechanisms; balanced_sampler toggles the sampler:
+  - balanced_sampler=True  : WeightedRandomSampler (~50/50 batches) + focal loss   [default]
+  - balanced_sampler=False : natural imbalance (plain shuffle) + focal loss only
+Compare the two via AUC (threshold-free) to see whether the sampler earns its place.
+
+No early stopping (fixed epochs, fair across runs). Returns (metrics_table, extras).
 """
 
 import numpy as np
@@ -23,7 +26,7 @@ from tcn import TCN
 MODEL_REGISTRY = {"tcn": TCN}
 
 LOOKBACK = 12
-VAL_PIDS = ["p04", "p10"]      # fallback when no 'split' column (BrisT1D)
+VAL_PIDS = ["p04", "p10"]          # fallback when no 'split' column (BrisT1D)
 SEED = 42
 FOCAL_GAMMA = 2.0
 
@@ -33,7 +36,6 @@ def set_seed(seed):
 
 
 def build_windows(df, features, task):
-    """Build windows from a dataframe (already filtered to the desired rows)."""
     X, y, who, coh = [], [], [], []
     target_col = "forecast_target" if task == "forecast" else "alert_label"
     has_cohort = "dataset" in df.columns
@@ -51,13 +53,6 @@ def build_windows(df, features, task):
     return (np.array(X, dtype=np.float32),
             np.array(y, dtype=np.float32),
             np.array(who), np.array(coh))
-
-
-def normalize(Xtr, *others, mu=None, sd=None):
-    if mu is None:
-        mu = Xtr.mean(axis=(0, 2), keepdims=True)
-        sd = Xtr.std(axis=(0, 2), keepdims=True) + 1e-8
-    return [(Xtr - mu) / sd] + [(o - mu) / sd for o in others] + [mu, sd]
 
 
 def focal_loss(logits, targets, gamma=FOCAL_GAMMA):
@@ -89,23 +84,29 @@ def alert_metrics(name, y_true, y_prob, thr=0.5):
             "AUC": round(auc, 4)}
 
 
-def run(csv_path, features, task, epochs=15, model_name="tcn", batch=256, lr=1e-3):
+def run(csv_path, features, task, epochs=15, model_name="tcn", batch=256, lr=1e-3,
+        balanced_sampler=True):
     set_seed(SEED)
     df = pd.read_csv(csv_path, parse_dates=["timestamp"])
 
     # ---- split selection ----
     if "split" in df.columns:
-        train_df = df[df["split"] == "train"]
-        val_df   = df[df["split"] == "val"]
+        train_df   = df[df["split"] == "train"]
+        val_df     = df[df["split"] == "val"]
         holdout_df = df[df["split"] == "holdout"]
     else:
-        train_df = df[~df["participant_id"].isin(VAL_PIDS)]
-        val_df   = df[df["participant_id"].isin(VAL_PIDS)]
-        holdout_df = df.iloc[0:0]   # empty
+        train_df   = df[~df["participant_id"].isin(VAL_PIDS)]
+        val_df     = df[df["participant_id"].isin(VAL_PIDS)]
+        holdout_df = df.iloc[0:0]
 
     Xtr, ytr, _, _ = build_windows(train_df, features, task)
     Xval, yval, who_val, coh_val = build_windows(val_df, features, task)
-    Xtr_n, Xval_n, mu, sd = normalize(Xtr, Xval)
+
+    # normalize with TRAIN stats only
+    mu = Xtr.mean(axis=(0, 2), keepdims=True)
+    sd = Xtr.std(axis=(0, 2), keepdims=True) + 1e-8
+    Xtr_n = (Xtr - mu) / sd
+    Xval_n = (Xval - mu) / sd
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = MODEL_REGISTRY[model_name](n_inputs=len(features), channels=32).to(device)
@@ -113,10 +114,13 @@ def run(csv_path, features, task, epochs=15, model_name="tcn", batch=256, lr=1e-
 
     tr_ds = TensorDataset(torch.tensor(Xtr_n), torch.tensor(ytr))
     if task == "alert":
-        pos = ytr.sum(); neg = len(ytr) - pos
-        w = np.where(ytr == 1, 1.0 / max(pos, 1), 1.0 / max(neg, 1))
-        sampler = WeightedRandomSampler(w, num_samples=len(ytr), replacement=True)
-        tr_dl = DataLoader(tr_ds, batch_size=batch, sampler=sampler)
+        if balanced_sampler:
+            pos = ytr.sum(); neg = len(ytr) - pos
+            w = np.where(ytr == 1, 1.0 / max(pos, 1), 1.0 / max(neg, 1))
+            sampler = WeightedRandomSampler(w, num_samples=len(ytr), replacement=True)
+            tr_dl = DataLoader(tr_ds, batch_size=batch, sampler=sampler)
+        else:
+            tr_dl = DataLoader(tr_ds, batch_size=batch, shuffle=True)
         loss_fn = focal_loss
     else:
         tr_dl = DataLoader(tr_ds, batch_size=batch, shuffle=True)
@@ -147,11 +151,11 @@ def run(csv_path, features, task, epochs=15, model_name="tcn", batch=256, lr=1e-
             print(f"epoch {ep+1}/{epochs}  train {tot/len(tr_ds):.4f}  val AUC {auc:.4f}  "
                   f"sens {m['sensitivity@0.5']:.3f}  far {m['false_alarm@0.5']:.3f}")
 
-    # ---- final evaluation: val (overall + per cohort) and holdout per cohort ----
-    def eval_group(Xg_n, yg, who_g, coh_g, label):
-        rows = []
+    # ---- final evaluation: val (overall + per cohort), holdout (per cohort) ----
+    def eval_group(Xg_n, yg, coh_g, label):
         with torch.no_grad():
             og = model(torch.tensor(Xg_n).to(device)).cpu().numpy()
+        rows = []
         if task == "alert":
             pg = 1 / (1 + np.exp(-og))
             rows.append(alert_metrics(f"{label}_ALL", yg, pg))
@@ -167,21 +171,21 @@ def run(csv_path, features, task, epochs=15, model_name="tcn", batch=256, lr=1e-
             return rows, og
 
     all_rows = []
-    val_rows, val_pred = eval_group(Xval_n, yval, who_val, coh_val, "val")
+    val_rows, val_pred = eval_group(Xval_n, yval, coh_val, "val")
     all_rows += val_rows
 
     holdout_extras = None
     if len(holdout_df) > 0:
         Xho, yho, who_ho, coh_ho = build_windows(holdout_df, features, task)
-        Xho_n, _, _ = normalize(Xho, mu=mu, sd=sd)   # normalize with TRAIN stats
-        ho_rows, ho_pred = eval_group(Xho_n, yho, who_ho, coh_ho, "holdout")
+        Xho_n = (Xho - mu) / sd
+        ho_rows, ho_pred = eval_group(Xho_n, yho, coh_ho, "holdout")
         all_rows += ho_rows
         holdout_extras = {"prob": ho_pred, "label": yho, "cohort": coh_ho}
 
     result = pd.DataFrame(all_rows)
-    result["experiment"] = f"{model_name}_{'+'.join(features)}_{task}"
+    result["experiment"] = f"{model_name}_{'+'.join(features)}_{task}_sampler{int(balanced_sampler)}"
 
     extras = {"val_prob": val_pred, "val_label": yval, "val_cohort": coh_val,
               "auc_history": auc_history, "holdout": holdout_extras,
-              "experiment": f"{model_name}_{'+'.join(features)}_{task}"}
+              "experiment": result["experiment"].iloc[0]}
     return result, extras
