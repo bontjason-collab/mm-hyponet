@@ -187,5 +187,6 @@ def run(csv_path, features, task, epochs=15, model_name="tcn", batch=256, lr=1e-
 
     extras = {"val_prob": val_pred, "val_label": yval, "val_cohort": coh_val,
               "auc_history": auc_history, "holdout": holdout_extras,
-              "experiment": result["experiment"].iloc[0]}
+              "experiment": result["experiment"].iloc[0],
+              "model": model}          # <-- ADD THIS
     return result, extras
