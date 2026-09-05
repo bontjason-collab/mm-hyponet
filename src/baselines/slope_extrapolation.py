@@ -46,19 +46,17 @@ def _windows(df, split_value=None):
 
 def _slope_score(window_glucose, W):
     """Score = LOW - projected_glucose_60min, using a least-squares slope
-    over the last W points of the 12-point window."""
-    sub = window_glucose[-W:]
-    t = np.arange(W) * STEP_MIN
-    # vectorized least-squares slope for each row
-    t_mean = t.mean()
-    t_c = t - t_mean
+    over the last W points of the 12-point window. Vectorized over all windows."""
+    sub = window_glucose[:, -W:]              # shape (n_windows, W)
+    t = np.arange(W) * STEP_MIN               # shape (W,)
+    t_c = t - t.mean()                        # shape (W,)
     denom = (t_c ** 2).sum()
-    sub_mean = sub.mean(axis=1, keepdims=True)
-    slope = ((t_c * (sub - sub_mean)).sum(axis=1)) / denom   # mg/dL per min, per window
+    sub_mean = sub.mean(axis=1, keepdims=True)  # shape (n_windows, 1)
+    # t_c broadcasts across rows: (W,) * (n_windows, W) works row-wise
+    slope = ((sub - sub_mean) * t_c).sum(axis=1) / denom   # (n_windows,)
     current = sub[:, -1]
     predicted = current + slope * HORIZON_MIN
-    return LOW_THRESHOLD - predicted     # higher = more heading-low
-
+    return LOW_THRESHOLD - predicted
 
 def evaluate(csv_path):
     df = pd.read_csv(csv_path, parse_dates=["timestamp"])
